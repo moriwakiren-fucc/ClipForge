@@ -3,6 +3,9 @@
  * 触りやすい操作領域、酸化ティールの選択状態、琥珀色のプレイヘッドを一貫して使用する。
  */
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
+import { useAuth } from "@/_core/hooks/useAuth";
+import { startLogin } from "@/const";
+import { trpc } from "@/lib/trpc";
 import {
   AlignCenter,
   AudioLines,
@@ -69,6 +72,7 @@ type MediaClip = {
   offset: number;
   muted?: boolean;
   color: string;
+  assetId?: number;
 };
 
 const HERO_STILL = "/manus-storage/clipforge-hero-studio_fe0146cd.png";
@@ -117,11 +121,19 @@ function getVideoDuration(file: File, url: string) {
 }
 
 export default function Home() {
+  // The useAuth hook provides authentication state.
+  // To implement login/logout, call logout(), or start login from an event
+  // handler: onClick={() => startLogin()} (imported from "@/const"). Never call
+  // startLogin() during render (no href={startLogin()}) — it mints a one-time
+  // nonce cookie and must run only at the moment of navigation.
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const rafRef = useRef<number | null>(null);
+  const { user, loading: authLoading, isAuthenticated, logout } = useAuth();
   const [clips, setClips] = useState<MediaClip[]>(seedClips);
+  const [projectId, setProjectId] = useState<number | null>(null);
   const [selectedId, setSelectedId] = useState("scene-a");
   const [currentTime, setCurrentTime] = useState(3.16);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -145,8 +157,41 @@ export default function Home() {
   const [captionAlign, setCaptionAlign] = useState<"left" | "center" | "right">("center");
   const [history, setHistory] = useState<string[]>(["プロジェクトを開きました"]);
   const [historyIndex, setHistoryIndex] = useState(0);
+  const projectsQuery = trpc.projects.list.useQuery(undefined, { enabled: isAuthenticated });
+  const createProjectMutation = trpc.projects.create.useMutation();
+  const uploadMutation = trpc.media.upload.useMutation();
+  const deleteMediaMutation = trpc.media.delete.useMutation();
+  const mediaQuery = trpc.media.list.useQuery({ projectId: projectId ?? 0 }, { enabled: Boolean(projectId) && isAuthenticated });
 
   const selectedClip = clips.find((clip) => clip.id === selectedId) ?? clips[0];
+
+  useEffect(() => {
+    if (!projectsQuery.data?.length || projectId) return;
+    setProjectId(projectsQuery.data[0].id);
+  }, [projectsQuery.data, projectId]);
+
+  useEffect(() => {
+    if (!isAuthenticated || projectId || createProjectMutation.isPending || projectsQuery.isLoading) return;
+    createProjectMutation.mutate({ name: "Untitled film" }, { onSuccess: (project) => setProjectId(project.id) });
+  }, [isAuthenticated, projectId, projectsQuery.isLoading, createProjectMutation.isPending]);
+
+  useEffect(() => {
+    if (!mediaQuery.data?.length) return;
+    const restored = mediaQuery.data.map((asset) => ({
+      id: `asset-${asset.id}`,
+      assetId: asset.id,
+      name: asset.filename.replace(/\.[^/.]+$/, ""),
+      kind: asset.mimeType.startsWith("video/") ? "video" as const : asset.mimeType.startsWith("audio/") ? "audio" as const : "image" as const,
+      url: asset.fileUrl,
+      duration: (asset.durationMs ?? 5000) / 1000,
+      trimStart: 0,
+      trimEnd: (asset.durationMs ?? 5000) / 1000,
+      offset: 0,
+      color: asset.mimeType.startsWith("audio/") ? "#a97850" : asset.mimeType.startsWith("image/") ? "#b68056" : "#417b91",
+    }));
+    setClips((previous) => [...restored, ...previous.filter((clip) => !clip.assetId)]);
+    setSelectedId(restored[0].id);
+  }, [mediaQuery.data]);
   const videoClips = clips.filter((clip) => clip.kind === "video" || clip.kind === "image");
   const audioClips = clips.filter((clip) => clip.kind === "audio");
   const projectDuration = useMemo(
@@ -259,20 +304,45 @@ export default function Home() {
 
   const openFilePicker = () => fileInputRef.current?.click();
 
+  const fileToBase64 = async (file: File) => {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let index = 0; index < bytes.length; index += chunkSize) binary += String.fromCharCode(...Array.from(bytes.subarray(index, index + chunkSize)));
+    return btoa(binary);
+  };
+
   const onFilesSelected = async (event: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files ?? []);
     if (!files.length) return;
+    if (!isAuthenticated || !projectId) {
+      toast.info("素材を保存するには、ClipForgeへログインしてください。");
+      startLogin();
+      event.target.value = "";
+      return;
+    }
     const nextClips: MediaClip[] = [];
     let nextOffset = Math.max(0, ...videoClips.map((clip) => clip.offset + (clip.trimEnd - clip.trimStart)));
     for (const file of files) {
       const url = URL.createObjectURL(file);
       const kind: ClipKind = file.type.startsWith("video/") ? "video" : file.type.startsWith("audio/") ? "audio" : "image";
       const duration = kind === "video" ? await getVideoDuration(file, url) : kind === "image" ? 5 : 30;
+      let storedUrl = url;
+      let storedAssetId: number | undefined;
+      try {
+        const stored = await uploadMutation.mutateAsync({ projectId, filename: file.name, mimeType: file.type || "application/octet-stream", byteSize: file.size, durationMs: Math.round(duration * 1000), base64: await fileToBase64(file) });
+        storedUrl = stored.fileUrl;
+        storedAssetId = stored.id;
+        URL.revokeObjectURL(url);
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "素材を保存できませんでした。ローカルプレビューを使用します。");
+      }
       nextClips.push({
         id: `${Date.now()}-${file.name}`,
+        assetId: storedAssetId,
         name: file.name.replace(/\.[^/.]+$/, ""),
         kind,
-        url,
+        url: storedUrl,
         duration,
         trimStart: 0,
         trimEnd: duration,
@@ -337,6 +407,7 @@ export default function Home() {
 
   const deleteSelected = () => {
     if (!selectedClip || clips.length <= 1) return;
+    if (selectedClip.assetId && projectId) deleteMediaMutation.mutate({ projectId, assetId: selectedClip.assetId });
     const remaining = clips.filter((clip) => clip.id !== selectedClip.id);
     setClips(remaining);
     setSelectedId(remaining[0].id);
@@ -481,7 +552,8 @@ export default function Home() {
           <button className="history-button" aria-label="元に戻す" disabled={historyIndex === 0} onClick={() => { setHistoryIndex((index) => Math.max(0, index - 1)); toast.info("直前の操作を取り消しました。"); }}><Undo2 size={18} /></button>
           <button className="history-button" aria-label="やり直す" disabled={historyIndex >= history.length - 1} onClick={() => { setHistoryIndex((index) => Math.min(history.length - 1, index + 1)); toast.info("操作をやり直しました。"); }}><Redo2 size={18} /></button>
           <span className="top-separator" />
-          <button className="compact-action" onClick={() => toast.info("この端末内のプロジェクト状態を自動保存しています。") }><Save size={16} /> 保存</button>
+          {authLoading ? <span className="saved-state">認証を確認中…</span> : isAuthenticated ? <button className="compact-action account-action" onClick={() => logout()}>{user?.name ?? "アカウント"} · ログアウト</button> : <button className="compact-action account-action" onClick={() => startLogin()}>ログイン</button>}
+          <button className="compact-action" onClick={() => toast.info("プロジェクト状態と素材メタデータを自動保存しています。") }><Save size={16} /> 保存</button>
           <button className="compact-action" onClick={() => toast.info("共有リンク機能はGitHub Pages公開後に利用できます。") }><Share2 size={16} /> 共有</button>
           <button className="export-button" onClick={exportVideo} disabled={isExporting}><Download size={17} />{isExporting ? `${exportProgress}%` : "書き出す"}</button>
         </div>
