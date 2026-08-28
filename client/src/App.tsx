@@ -7,8 +7,12 @@ import { ThemeProvider } from "./contexts/ThemeContext";
 import Home from "./pages/Home";
 
 function Router() {
+  const base = typeof window !== "undefined" && window.location.pathname.startsWith("/ClipForge")
+    ? "/ClipForge"
+    : "";
+
   return (
-    <WouterRouter base="/ClipForge">
+    <WouterRouter base={base}>
       <Switch>
         <Route path="/" component={Home} />
         <Route path="/404" component={NotFound} />
